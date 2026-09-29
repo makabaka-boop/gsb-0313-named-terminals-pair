@@ -41,8 +41,8 @@
         </label>
 
         <label>
-          词序列（逗号或空格分隔；留空表示空串，最多 40 项）
-          <input v-model="tokenText" aria-label="词序列" data-testid="tokens-input" placeholder="i + i" />
+          词序列（逗号或空格分隔；留空表示空串，最多 40 项；具名终结符可写 id 或 {id}）
+          <input v-model="tokenText" aria-label="词序列" data-testid="tokens-input" placeholder="如 i p o；具名终结符可写 id 或 {id}" />
         </label>
 
         <div class="actions">
@@ -217,7 +217,13 @@ function normalizeProductions(value) {
 }
 
 function splitTokens(value) {
-  return value.split(/[\s,]+/).map((token) => token.trim()).filter(Boolean)
+  // 允许用户在词序列里写 {id}：只剥掉成对的外层花括号，
+  // 不成对的花括号原样上送，由服务端在栈回放里判为非法词。
+  return value
+    .split(/[\s,]+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .map((token) => (/^\{([a-z]{2,12})\}$/.test(token) ? token.slice(1, -1) : token))
 }
 
 function makeRequestId(seq) {
@@ -304,7 +310,7 @@ function formatRule(rule) {
 
 function formatTerminalSet(values, nullable) {
   const rendered = [...(values || [])]
-  if (nullable) values.push('ε')
-  return values.length ? `{ ${values.join(', ')} }` : '∅'
+  if (nullable) rendered.push('ε')
+  return rendered.length ? `{ ${rendered.join(', ')} }` : '∅'
 }
 </script>

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
@@ -60,8 +61,8 @@ type AnalyzeResponse struct {
 }
 
 type grammarRule struct {
-	lhs  byte
-	rhs  string
+	lhs  string
+	rhs  []string
 	text string
 }
 
@@ -102,7 +103,7 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 	if len(tokens) > 40 {
 		return resp, &validationError{"词序列最多包含 40 项"}
 	}
-	if len(start) != 1 || !isNonterminalByte(start[0]) {
+	if len(start) != 1 || !isNonterminal(start) {
 		return resp, &validationError{"开始符必须是一个大写非终结符"}
 	}
 	if len(productions) == 0 {
@@ -113,10 +114,10 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 	}
 
 	rules := make([]grammarRule, 0, len(productions))
-	ntSet := map[byte]bool{start[0]: true}
-	terminalSet := map[byte]bool{}
+	ntSet := map[string]bool{start: true}
+	terminalSet := map[string]bool{}
 	seenRule := map[string]bool{}
-	lhsHasRule := map[byte]bool{}
+	lhsHasRule := map[string]bool{}
 
 	for _, production := range productions {
 		parts := strings.SplitN(production, "->", 2)
@@ -124,28 +125,27 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 			return resp, &validationError{"产生式必须形如 A->α：" + production}
 		}
 		lhsText := strings.TrimSpace(parts[0])
-		rhs := strings.TrimSpace(parts[1])
-		if len(lhsText) != 1 || !isNonterminalByte(lhsText[0]) {
+		rhsText := strings.TrimSpace(parts[1])
+		if len(lhsText) != 1 || !isNonterminal(lhsText) {
 			return resp, &validationError{"产生式左部必须是一个大写非终结符：" + production}
 		}
-		flatRHS, ok := flattenNamedTerminals(rhs)
-		if !ok {
-			return resp, &validationError{"产生式右部符号格式错误：" + production}
+		rhsSymbols, err := tokenizeRHS(rhsText)
+		if err != nil {
+			return resp, &validationError{"产生式右部符号格式错误：" + production + "（" + err.Error() + "）"}
 		}
 		if seenRule[production] {
 			return resp, &validationError{"重复产生式：" + production}
 		}
 		seenRule[production] = true
 
-		lhs := lhsText[0]
-		rules = append(rules, grammarRule{lhs: lhs, rhs: flatRHS, text: production})
-		ntSet[lhs] = true
-		lhsHasRule[lhs] = true
-		for i := 0; i < len(rhs); i++ {
-			if isNonterminalByte(rhs[i]) {
-				ntSet[rhs[i]] = true
+		rules = append(rules, grammarRule{lhs: lhsText, rhs: rhsSymbols, text: production})
+		ntSet[lhsText] = true
+		lhsHasRule[lhsText] = true
+		for _, symbol := range rhsSymbols {
+			if isNonterminal(symbol) {
+				ntSet[symbol] = true
 			} else {
-				terminalSet[rhs[i]] = true
+				terminalSet[symbol] = true
 			}
 		}
 	}
@@ -153,14 +153,13 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 	if len(ntSet) > 15 {
 		return resp, &validationError{"大写非终结符最多 15 个"}
 	}
-	if !lhsHasRule[start[0]] {
+	if !lhsHasRule[start] {
 		return resp, &validationError{"开始符必须至少出现在一条产生式左部"}
 	}
 	for _, rule := range rules {
-		for i := 0; i < len(rule.rhs); i++ {
-			symbol := rule.rhs[i]
-			if isNonterminalByte(symbol) && !lhsHasRule[symbol] {
-				return resp, &validationError{"非终结符 " + string(symbol) + " 缺少产生式"}
+		for _, symbol := range rule.rhs {
+			if isNonterminal(symbol) && !lhsHasRule[symbol] {
+				return resp, &validationError{"非终结符 " + symbol + " 缺少产生式"}
 			}
 		}
 	}
@@ -170,14 +169,14 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 		}
 	}
 
-	nonterminals := sortedByteList(ntSet)
-	terminals := sortedTerminalNames(terminalSet)
+	nonterminals := sortedStringSet(ntSet)
+	terminals := sortedStringSet(terminalSet)
 	terminals = append(terminals, "$")
-	resp.Nonterminals = bytesToStrings(nonterminals)
+	resp.Nonterminals = nonterminals
 	resp.Terminals = terminals
 
-	nullable := map[byte]bool{}
-	rhsFirst := make([][]byte, len(rules))
+	nullable := map[string]bool{}
+	rhsFirst := make([][]string, len(rules))
 	rhsNullable := make([]bool, len(rules))
 
 	// 定点迭代：先单独计算可空性，避免把 FOLLOW 的 $ 或 ε 混入 FIRST。
@@ -188,9 +187,8 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 				continue
 			}
 			canBeEmpty := true
-			for i := 0; i < len(rule.rhs); i++ {
-				symbol := rule.rhs[i]
-				if isTerminalByte(symbol) || !nullable[symbol] {
+			for _, symbol := range rule.rhs {
+				if isTerminal(symbol) || !nullable[symbol] {
 					canBeEmpty = false
 					break
 				}
@@ -202,19 +200,18 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 		}
 	}
 
-	firstSets := map[byte]map[byte]bool{}
+	firstSets := map[string]map[string]bool{}
 	for _, nt := range nonterminals {
-		firstSets[nt] = map[byte]bool{}
+		firstSets[nt] = map[string]bool{}
 	}
 	for changed := true; changed; {
 		changed = false
 		for ruleIndex, rule := range rules {
 			first := firstSets[rule.lhs]
-			rhsTerminals := []byte{}
+			rhsTerminals := []string{}
 			allNullable := len(rule.rhs) == 0
-			for i := 0; i < len(rule.rhs); i++ {
-				symbol := rule.rhs[i]
-				if isTerminalByte(symbol) {
+			for _, symbol := range rule.rhs {
+				if isTerminal(symbol) {
 					rhsTerminals = append(rhsTerminals, symbol)
 					if !first[symbol] {
 						first[symbol] = true
@@ -240,16 +237,16 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 		}
 	}
 
-	followSets := map[byte]map[byte]bool{}
+	followSets := map[string]map[string]bool{}
 	for _, nt := range nonterminals {
-		followSets[nt] = map[byte]bool{}
+		followSets[nt] = map[string]bool{}
 	}
-	followSets[start[0]]['$'] = true
+	followSets[start]["$"] = true
 
 	for changed := true; changed; {
 		changed = false
-		addFollow := func(from, terminal byte) {
-			if terminal != '$' && !isTerminalByte(terminal) {
+		addFollow := func(from, terminal string) {
+			if terminal != "$" && !isTerminal(terminal) {
 				return
 			}
 			if !followSets[from][terminal] {
@@ -260,16 +257,15 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 
 		for _, rule := range rules {
 			rhs := rule.rhs
-			for i := 0; i < len(rhs); i++ {
-				symbol := rhs[i]
-				if !isNonterminalByte(symbol) {
+			for i, symbol := range rhs {
+				if !isNonterminal(symbol) {
 					continue
 				}
-				betaFirst := []byte{}
+				betaFirst := []string{}
 				betaNullable := true
 				for j := i + 1; j < len(rhs); j++ {
 					next := rhs[j]
-					if isTerminalByte(next) {
+					if isTerminal(next) {
 						betaFirst = append(betaFirst, next)
 						betaNullable = false
 						break
@@ -295,12 +291,11 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 	}
 
 	for _, nt := range resp.Nonterminals {
-		symbol := nt[0]
 		resp.First[nt] = SetInfo{
-			Terminals: sortedSet(firstSets[symbol]),
-			Nullable:  nullable[symbol],
+			Terminals: sortedStringSet(firstSets[nt]),
+			Nullable:  nullable[nt],
 		}
-		resp.Follow[nt] = sortedSet(followSets[symbol])
+		resp.Follow[nt] = sortedStringSet(followSets[nt])
 	}
 
 	tableMap := map[string]*TableCell{}
@@ -321,7 +316,7 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 		sort.Ints(cell.RuleIDs)
 		table = append(table, *cell)
 		if len(cell.RuleIDs) > 1 {
-			if conflict == nil || symbolPairLess(cell.Nonterminal[0], cell.Terminal[0], conflict.Nonterminal[0], conflict.Terminal[0]) {
+			if conflict == nil || symbolPairLess(cell.Nonterminal, cell.Terminal, conflict.Nonterminal, conflict.Terminal) {
 				candidates := make([]string, 0, len(cell.RuleIDs))
 				for _, id := range cell.RuleIDs {
 					candidates = append(candidates, rules[id].text)
@@ -336,7 +331,7 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 		}
 	}
 	sort.Slice(table, func(i, j int) bool {
-		return symbolPairLess(table[i].Nonterminal[0], table[i].Terminal[0], table[j].Nonterminal[0], table[j].Terminal[0])
+		return symbolPairLess(table[i].Nonterminal, table[i].Terminal, table[j].Nonterminal, table[j].Terminal)
 	})
 	resp.Table = table
 	if conflict != nil {
@@ -348,7 +343,7 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 	lookup := map[string]int{}
 	for _, cell := range table {
 		if len(cell.RuleIDs) == 1 {
-			lookup[cell.Nonterminal+cell.Terminal] = cell.RuleIDs[0]
+			lookup[cell.Nonterminal+"\x00"+cell.Terminal] = cell.RuleIDs[0]
 		}
 	}
 	resp.Steps = runPredictiveParser(start, rules, tokens, lookup, terminalSet)
@@ -359,17 +354,13 @@ func Analyze(req AnalyzeRequest) (AnalyzeResponse, error) {
 	return resp, nil
 }
 
-func runPredictiveParser(start string, rules []grammarRule, tokens []string, lookup map[string]int, grammarTerminals map[byte]bool) []ParseStep {
-	stack := []byte{'$', start[0]}
+func runPredictiveParser(start string, rules []grammarRule, tokens []string, lookup map[string]int, grammarTerminals map[string]bool) []ParseStep {
+	// 栈顶在末尾，元素是文法符号：非终结符、单字母或具名终结符。
+	stack := []string{"$", start}
 	remainingTokens := append([]string(nil), tokens...)
 	steps := []ParseStep{}
 	snapshot := func(action, label, message string, ruleID *int, ruleText string) ParseStep {
-		remaining := strings.Join(remainingTokens, " ")
-		if remaining != "" {
-			remaining += " "
-		}
-		remaining += "$"
-		stackCopy := append([]byte(nil), stack...)
+		stackCopy := append([]string(nil), stack...)
 		for i, j := 0, len(stackCopy)-1; i < j; i, j = i+1, j-1 {
 			stackCopy[i], stackCopy[j] = stackCopy[j], stackCopy[i]
 		}
@@ -377,8 +368,8 @@ func runPredictiveParser(start string, rules []grammarRule, tokens []string, loo
 			Step:        len(steps) + 1,
 			Action:      action,
 			ActionLabel: label,
-			Stack:       string(stackCopy),
-			Remaining:   remaining,
+			Stack:       joinTokenDisplay(stackCopy),
+			Remaining:   joinTokenDisplay(append(append([]string(nil), remainingTokens...), "$")),
 			UsedRuleID:  ruleID,
 			Rule:        ruleText,
 			Message:     message,
@@ -391,40 +382,37 @@ func runPredictiveParser(start string, rules []grammarRule, tokens []string, loo
 		if len(remainingTokens) > 0 {
 			currentToken = remainingTokens[0]
 		}
-		current := currentToken[0]
 
-		if top == '$' && currentToken == "$" {
+		if top == "$" && currentToken == "$" {
 			steps = append(steps, snapshot("accept", "接受", "", nil, ""))
 			return steps
 		}
 
 		if currentToken != "$" {
-			if len(currentToken) != 1 || !isTerminalByte(current) || !grammarTerminals[current] {
+			if !grammarTerminals[currentToken] {
 				message := "非法词：" + currentToken
 				steps = append(steps, snapshot("error", "错误", message, nil, ""))
 				return steps
 			}
-		} else {
-			current = '$'
 		}
 
-		if isTerminalByte(top) || top == '$' {
-			if top != current {
+		if isTerminal(top) || top == "$" {
+			if top != currentToken {
 				expected := displaySymbol(top)
-				got := displaySymbol(current)
+				got := displaySymbol(currentToken)
 				message := "匹配失败：期望 " + expected + "，实际遇到 " + got
 				steps = append(steps, snapshot("error", "错误", message, nil, ""))
 				return steps
 			}
 			stack = stack[:len(stack)-1]
 			remainingTokens = remainingTokens[1:]
-			steps = append(steps, snapshot("match", "匹配 "+string(top), "", nil, ""))
+			steps = append(steps, snapshot("match", "匹配 "+displaySymbol(top), "", nil, ""))
 			continue
 		}
 
-		ruleID, ok := lookup[string(top)+string(current)]
+		ruleID, ok := lookup[top+"\x00"+currentToken]
 		if !ok {
-			message := "分析表 M[" + string(top) + ", " + displaySymbol(current) + "] 为空，无法选择产生式"
+			message := "分析表 M[" + top + ", " + displaySymbol(currentToken) + "] 为空，无法选择产生式"
 			steps = append(steps, snapshot("error", "错误", message, nil, ""))
 			return steps
 		}
@@ -435,19 +423,53 @@ func runPredictiveParser(start string, rules []grammarRule, tokens []string, loo
 			stack = append(stack, rhs[i])
 		}
 		id := ruleID
-		rhsLabel := rhs
-		if rhsLabel == "" {
-			rhsLabel = "ε"
-		}
-		steps = append(steps, snapshot("expand", "展开", "", &id, string(rules[ruleID].lhs)+" -> "+rhsLabel))
+		rhsLabel := formatRHS(rhs)
+		steps = append(steps, snapshot("expand", "展开", "", &id, rules[ruleID].lhs+" -> "+rhsLabel))
 	}
 }
 
-func addTableCell(tableMap map[string]*TableCell, lhs, terminal byte, ruleID int) {
-	key := string(lhs) + string(terminal)
+// tokenizeRHS 把产生式右部切成原子文法符号：
+// 大写字母是非终结符，单个小写字母是单字母终结符，{name} 是具名终结符（一个完整词）。
+func tokenizeRHS(value string) ([]string, error) {
+	symbols := []string{}
+	for i := 0; i < len(value); {
+		switch {
+		case value[i] == '{':
+			end := strings.IndexByte(value[i+1:], '}')
+			if end < 0 {
+				return nil, errors.New("花括号 { 缺少配对的 }")
+			}
+			name := value[i+1 : i+1+end]
+			if len(name) < 2 || len(name) > 12 {
+				return nil, errors.New("具名终结符名称长度必须为 2～12 位小写字母")
+			}
+			for j := 0; j < len(name); j++ {
+				if !isTerminalByte(name[j]) {
+					return nil, errors.New("具名终结符只能使用小写字母 a-z：{" + name + "}")
+				}
+			}
+			symbols = append(symbols, name)
+			i += end + 2
+		case value[i] == '}':
+			return nil, errors.New("花括号 } 缺少配对的 {")
+		case isNonterminalByte(value[i]):
+			symbols = append(symbols, string(value[i]))
+			i++
+		case isTerminalByte(value[i]):
+			symbols = append(symbols, string(value[i]))
+			i++
+		default:
+			return nil, errors.New("右部只能包含大写非终结符、小写字母或 {名称}")
+		}
+	}
+	return symbols, nil
+}
+
+func addTableCell(tableMap map[string]*TableCell, lhs, terminal string, ruleID int) {
+	key := lhs + "\x00" + terminal
 	cell := tableMap[key]
 	if cell == nil {
-		cell = &TableCell{Nonterminal: string(lhs), Terminal: string(terminal)}
+		cell = &TableCell{Nonterminal: lhs, Terminal: terminal}
 		tableMap[key] = cell
 	}
 	for _, existing := range cell.RuleIDs {
@@ -458,6 +480,22 @@ func addTableCell(tableMap map[string]*TableCell, lhs, terminal byte, ruleID int
 	cell.RuleIDs = append(cell.RuleIDs, ruleID)
 }
 
+func isNonterminal(value string) bool {
+	return len(value) == 1 && value[0] >= 'A' && value[0] <= 'Z'
+}
+
+func isTerminal(value string) bool {
+	if len(value) == 0 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 'a' || value[i] > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
 func isNonterminalByte(value byte) bool {
 	return value >= 'A' && value <= 'Z'
 }
@@ -466,101 +504,72 @@ func isTerminalByte(value byte) bool {
 	return value >= 'a' && value <= 'z'
 }
 
-func isGrammarSymbolString(value string) bool {
-	for i := 0; i < len(value); i++ {
-		if !isNonterminalByte(value[i]) && !isTerminalByte(value[i]) {
-			return false
+// formatRHS 把右部符号序列还原成产生式文本，具名终结符仍带花括号。
+func formatRHS(symbols []string) string {
+	if len(symbols) == 0 {
+		return "ε"
+	}
+	var builder strings.Builder
+	for _, symbol := range symbols {
+		if isNonterminal(symbol) {
+			builder.WriteString(symbol)
+		} else {
+			builder.WriteString("{" + symbol + "}")
 		}
 	}
-	return true
+	return builder.String()
 }
 
-// Named terminals such as {id} are accepted alongside legacy letters.
-func flattenNamedTerminals(value string) (string, bool) {
-	var flat strings.Builder
-	for i := 0; i < len(value); {
-		if value[i] == '{' {
-			end := strings.IndexByte(value[i+1:], '}')
-			if end < 0 {
-				return "", false
-			}
-			name := value[i+1 : i+1+end]
-			if len(name) < 2 || len(name) > 12 {
-				return "", false
-			}
-			for j := 0; j < len(name); j++ {
-				if !isTerminalByte(name[j]) {
-					return "", false
-				}
-			}
-			flat.WriteString(name)
-			i += end + 2
-			continue
-		}
-		if !isTerminalByte(value[i]) && !isNonterminalByte(value[i]) {
-			return "", false
-		}
-		flat.WriteByte(value[i])
-		i++
+// displaySymbol 用于面向用户的消息：具名终结符显示为 {name}，$ 显示为结束符 $。
+func displaySymbol(value string) string {
+	if value == "$" {
+		return "结束符 $"
 	}
-	return flat.String(), true
+	if isTerminal(value) && len(value) > 1 {
+		return "{" + value + "}"
+	}
+	return value
 }
 
-func sortedByteList(values map[byte]bool) []byte {
-	list := make([]byte, 0, len(values))
+// joinTokenDisplay 渲染栈回放中的符号序列：相邻的单字母符号与 $ 紧凑拼接，
+// 具名终结符加花括号并与相邻符号保留空格，确保 {id} 不被读成 i、d。
+func joinTokenDisplay(symbols []string) string {
+	type piece struct {
+		text string
+		wide bool
+	}
+	parts := make([]piece, 0, len(symbols))
+	for _, symbol := range symbols {
+		if isTerminal(symbol) && len(symbol) > 1 {
+			parts = append(parts, piece{"{" + symbol + "}", true})
+		} else {
+			parts = append(parts, piece{symbol, false})
+		}
+	}
+	var builder strings.Builder
+	for index, part := range parts {
+		if index > 0 && (part.wide || parts[index-1].wide) {
+			builder.WriteString(" ")
+		}
+		builder.WriteString(part.text)
+	}
+	return builder.String()
+}
+
+func sortedStringSet(values map[string]bool) []string {
+	list := make([]string, 0, len(values))
 	for value := range values {
 		list = append(list, value)
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i] < list[j] })
+	sort.Strings(list)
 	return list
 }
 
-func sortedTerminalNames(values map[byte]bool) []string {
-	result := make([]string, 0, len(values))
-	bytesList := make([]byte, 0, len(values))
-	for value := range values {
-		bytesList = append(bytesList, value)
-	}
-	sort.Slice(bytesList, func(i, j int) bool { return bytesList[i] < bytesList[j] })
-	for _, value := range bytesList {
-		result = append(result, string(value))
-	}
-	return result
-}
-
-func bytesToStrings(values []byte) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		result = append(result, string(value))
-	}
-	return result
-}
-
-func sortedSet(values map[byte]bool) []string {
-	list := make([]byte, 0, len(values))
-	for value := range values {
-		list = append(list, value)
-	}
-	sort.Slice(list, func(i, j int) bool { return list[i] < list[j] })
-	result := make([]string, 0, len(list))
-	for _, value := range list {
-		result = append(result, string(value))
-	}
-	return result
-}
-
-func symbolPairLess(aNonterminal, aTerminal, bNonterminal, bTerminal byte) bool {
+func symbolPairLess(aNonterminal, aTerminal, bNonterminal, bTerminal string) bool {
 	if aNonterminal != bNonterminal {
 		return aNonterminal < bNonterminal
 	}
 	return aTerminal < bTerminal
-}
-
-func displaySymbol(value byte) string {
-	if value == '$' {
-		return "结束符 $"
-	}
-	return string(value)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
